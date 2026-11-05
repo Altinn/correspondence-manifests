@@ -1,0 +1,333 @@
+name: Publish Flux artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment whose image tags changed (at23, tt02, yt01 or prod). If the environment has a Receiver, its cluster is asked to fetch the new app artifact right after publishing.
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+
+env:
+  SYNCROOT_ARTIFACT_NAME: correspondence/syncroot
+  EDGE_SYNCROOT_ARTIFACT_NAME: correspondence/edge-syncroot
+  APP_ARTIFACT_NAME: correspondence/correspondence-sync
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-flux-artifacts-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish-syncroot:
+    name: Publish syncroot artifact
+    if: github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        tag: [at23]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install kustomize
+        env:
+          # Official kustomize binary (no Docker, no sudo) so this job can run on
+          # self-hosted runners, which ship neither kustomize nor kubectl.
+          # renovate: datasource=github-releases depName=kubernetes-sigs/kustomize versioning=semver extractVersion=^kustomize\/(?<version>v.+)$
+          KUSTOMIZE_VERSION: v5.8.1
+        run: |
+          set -euo pipefail
+
+          case "$(uname -m)" in
+            x86_64) arch=amd64 ;;
+            aarch64 | arm64) arch=arm64 ;;
+            *) echo "::error::Unsupported architecture: $(uname -m)"; exit 1 ;;
+          esac
+
+          dest="${RUNNER_TEMP:-/tmp}/kustomize-bin"
+          mkdir -p "$dest"
+          tarball="kustomize_${KUSTOMIZE_VERSION}_linux_${arch}.tar.gz"
+          url="https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/${tarball}"
+
+          if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$url" -o "$dest/$tarball"
+          elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$dest/$tarball" "$url"
+          else
+            echo "::error::Neither curl nor wget is available on the runner."
+            exit 1
+          fi
+
+          tar -xzf "$dest/$tarball" -C "$dest" kustomize
+          rm -f "$dest/$tarball"
+          chmod +x "$dest/kustomize"
+          echo "$dest" >> "$GITHUB_PATH"
+          "$dest/kustomize" version
+
+      - name: Validate syncroot structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          render_kustomize() {
+            local path="$1"
+            if command -v kustomize >/dev/null 2>&1; then
+              kustomize build "$path"
+              return
+            fi
+            if command -v kubectl >/dev/null 2>&1; then
+              kubectl kustomize "$path"
+              return
+            fi
+            echo "::error::Neither 'kustomize' nor 'kubectl' found in runner PATH."
+            exit 1
+          }
+
+          # flux/syncroot/base pins spec.path to one environment, so every overlay
+          # must patch it. An overlay that forgets would publish a syncroot that
+          # deploys the base environment's manifests instead of its own. Assert on
+          # the rendered path: a patch aimed at the wrong resource name parses fine
+          # but never applies, leaving the base's hardcoded spec.path in place.
+          for dir in ./manifests/environments/*/; do
+            env=$(basename "$dir")
+            overlay="./flux/syncroot/${env}/kustomization.yaml"
+
+            if [ ! -f "$overlay" ]; then
+              echo "::error::Missing ${overlay}"
+              exit 1
+            fi
+
+            selected=$(render_kustomize "./flux/syncroot/${env}" | sed -n 's/^[[:space:]]*path:[[:space:]]*//p')
+            if [ "$selected" != "./environments/${env}" ]; then
+              echo "::error::./flux/syncroot/${env}/ selects '${selected:-<none>}' but must select ./environments/${env}"
+              exit 1
+            fi
+          done
+
+      - name: Build and push syncroot artifact
+        uses: Altinn/altinn-platform/actions/flux/build-push-image@523f141da4f116fdd7331585396d83a5d7ade7ea # main
+        with:
+          image_name: ${{ env.SYNCROOT_ARTIFACT_NAME }}
+          tag: ${{ matrix.tag }}
+          workdir: ./flux/syncroot
+          azure_subscription_id: ${{ secrets.DIS_SYNCROOT_AZURE_SUBSCRIPTION_ID }}
+          azure_app_id: ${{ secrets.DIS_SYNCROOT_AZURE_CLIENT_ID }}
+          azure_tenant_id: ${{ secrets.DIS_SYNCROOT_AZURE_TENANT_ID }}
+
+  publish-edge-syncroot:
+    name: Publish edge-syncroot artifact
+    if: github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        tag: [at23, tt02, prod]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install kustomize
+        env:
+          # Official kustomize binary (no Docker, no sudo) so this job can run on
+          # self-hosted runners, which ship neither kustomize nor kubectl.
+          # renovate: datasource=github-releases depName=kubernetes-sigs/kustomize versioning=semver extractVersion=^kustomize\/(?<version>v.+)$
+          KUSTOMIZE_VERSION: v5.8.1
+        run: |
+          set -euo pipefail
+
+          case "$(uname -m)" in
+            x86_64) arch=amd64 ;;
+            aarch64 | arm64) arch=arm64 ;;
+            *) echo "::error::Unsupported architecture: $(uname -m)"; exit 1 ;;
+          esac
+
+          dest="${RUNNER_TEMP:-/tmp}/kustomize-bin"
+          mkdir -p "$dest"
+          tarball="kustomize_${KUSTOMIZE_VERSION}_linux_${arch}.tar.gz"
+          url="https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/${tarball}"
+
+          if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$url" -o "$dest/$tarball"
+          elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$dest/$tarball" "$url"
+          else
+            echo "::error::Neither curl nor wget is available on the runner."
+            exit 1
+          fi
+
+          tar -xzf "$dest/$tarball" -C "$dest" kustomize
+          rm -f "$dest/$tarball"
+          chmod +x "$dest/kustomize"
+          echo "$dest" >> "$GITHUB_PATH"
+          "$dest/kustomize" version
+
+      - name: Validate edge-syncroot structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          overlay="./flux/edge-syncroot/${{ matrix.tag }}/kustomization.yaml"
+          if [ ! -f "$overlay" ]; then
+            echo "::error::Missing ${overlay}"
+            exit 1
+          fi
+
+          # flux/edge-syncroot/base uses placeholder hostnames, so every overlay
+          # must replace them. Assert on the rendered output: a patch aimed at the
+          # wrong resource name parses fine but never applies.
+          rendered=$(kustomize build "./flux/edge-syncroot/${{ matrix.tag }}")
+          if grep -q 'placeholder\.invalid' <<<"$rendered"; then
+            echo "::error::./flux/edge-syncroot/${{ matrix.tag }}/ leaves base placeholder hostnames unpatched"
+            exit 1
+          fi
+
+      - name: Build and push edge-syncroot artifact
+        uses: Altinn/altinn-platform/actions/flux/build-push-image@523f141da4f116fdd7331585396d83a5d7ade7ea # main
+        with:
+          image_name: ${{ env.EDGE_SYNCROOT_ARTIFACT_NAME }}
+          tag: ${{ matrix.tag }}
+          workdir: ./flux/edge-syncroot
+          azure_subscription_id: ${{ secrets.DIS_SYNCROOT_AZURE_SUBSCRIPTION_ID }}
+          azure_app_id: ${{ secrets.DIS_SYNCROOT_AZURE_CLIENT_ID }}
+          azure_tenant_id: ${{ secrets.DIS_SYNCROOT_AZURE_TENANT_ID }}
+
+  publish-app-manifests:
+    name: Publish app manifests artifact
+    if: github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install kustomize
+        env:
+          # Official kustomize binary (no Docker, no sudo) so this job can run on
+          # self-hosted runners, which ship neither kustomize nor kubectl.
+          # renovate: datasource=github-releases depName=kubernetes-sigs/kustomize versioning=semver extractVersion=^kustomize\/(?<version>v.+)$
+          KUSTOMIZE_VERSION: v5.8.1
+        run: |
+          set -euo pipefail
+
+          case "$(uname -m)" in
+            x86_64) arch=amd64 ;;
+            aarch64 | arm64) arch=arm64 ;;
+            *) echo "::error::Unsupported architecture: $(uname -m)"; exit 1 ;;
+          esac
+
+          dest="${RUNNER_TEMP:-/tmp}/kustomize-bin"
+          mkdir -p "$dest"
+          tarball="kustomize_${KUSTOMIZE_VERSION}_linux_${arch}.tar.gz"
+          url="https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/${tarball}"
+
+          if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$url" -o "$dest/$tarball"
+          elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$dest/$tarball" "$url"
+          else
+            echo "::error::Neither curl nor wget is available on the runner."
+            exit 1
+          fi
+
+          tar -xzf "$dest/$tarball" -C "$dest" kustomize
+          rm -f "$dest/$tarball"
+          chmod +x "$dest/kustomize"
+          echo "$dest" >> "$GITHUB_PATH"
+          "$dest/kustomize" version
+
+      - name: Validate app manifests structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for dir in ./manifests/environments/*/; do
+            env=$(basename "$dir")
+            if [ ! -f "./manifests/environments/${env}/kustomization.yaml" ]; then
+              echo "Error: Missing ./manifests/environments/${env}/kustomization.yaml"
+              exit 1
+            fi
+          done
+
+          for dir in ./manifests/apps/*/ ./manifests/jobs/*/; do
+            if [ ! -f "${dir}base/kustomization.yaml" ]; then
+              echo "Error: Missing ${dir}base/kustomization.yaml"
+              exit 1
+            fi
+          done
+
+          if [ -d "./manifests/apps/components" ] || [ -d "./manifests/apps/base" ]; then
+            echo "Error: Legacy app manifest paths detected (manifests/apps/components or manifests/apps/base)."
+            exit 1
+          fi
+
+          if grep -R --include='kustomization.yaml' -n 'patchesStrategicMerge' ./manifests/environments; then
+            echo "Error: Found deprecated patchesStrategicMerge usage."
+            exit 1
+          fi
+
+          build_kustomize() {
+            local path="$1"
+            if command -v kustomize >/dev/null 2>&1; then
+              kustomize build "$path" >/dev/null
+              return
+            fi
+            if command -v kubectl >/dev/null 2>&1; then
+              kubectl kustomize "$path" >/dev/null
+              return
+            fi
+            echo "Error: Neither 'kustomize' nor 'kubectl' found in runner PATH."
+            exit 1
+          }
+
+          for dir in ./manifests/environments/*/; do
+            env=$(basename "$dir")
+            build_kustomize "./manifests/environments/${env}"
+            build_kustomize "./flux/syncroot/${env}"
+          done
+
+      - name: Build and push app manifests artifact
+        uses: Altinn/altinn-platform/actions/flux/build-push-image@523f141da4f116fdd7331585396d83a5d7ade7ea # main
+        with:
+          image_name: ${{ env.APP_ARTIFACT_NAME }}
+          tag: main
+          workdir: ./manifests
+          azure_subscription_id: ${{ secrets.DIS_SYNCROOT_AZURE_SUBSCRIPTION_ID }}
+          azure_app_id: ${{ secrets.DIS_SYNCROOT_AZURE_CLIENT_ID }}
+          azure_tenant_id: ${{ secrets.DIS_SYNCROOT_AZURE_TENANT_ID }}
+
+      # Flux polls the app artifact every 10 minutes. When the run names the
+      # environment whose image tags changed, ask that cluster to fetch the new
+      # artifact now (RFC 0017). Best effort: the next poll still picks it up
+      # if this fails. List only environments whose flux/syncroot/<env>
+      # overlay has the Receiver. The request goes to the environment's
+      # webhook endpoint on the DIS edge gateway.
+      - name: Trigger Flux reconcile
+        if: contains(fromJSON('["at23"]'), inputs.environment)
+        continue-on-error: true
+        uses: Altinn/altinn-platform/actions/flux/trigger-reconcile@96629ce10dc68e839968fbae100e7372c46d1454 # main
+        with:
+          url: https://ops.${{ inputs.environment }}.dis.altinn.cloud/flux-webhook
+          receiver_name: correspondence-manifests
+          receiver_namespace: product-correspondence
+
+  notify-failure:
+    name: Send Slack message on failure
+    needs: [publish-syncroot, publish-edge-syncroot, publish-app-manifests]
+    if: ${{ failure() && !cancelled() }}
+    uses: ./.github/workflows/workflow-send-ci-cd-status-slack-message.yml
+    with:
+      title: Flux artifact publishing failed
+      details: |
+        Ref: ${{ github.ref_name }}
+        Commit: ${{ github.sha }}
+        Publish syncroot artifact: ${{ needs.publish-syncroot.result }}
+        Publish edge-syncroot artifact: ${{ needs.publish-edge-syncroot.result }}
+        Publish app manifests artifact: ${{ needs.publish-app-manifests.result }}
+    secrets:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID_FOR_CI_CD_STATUS }}
