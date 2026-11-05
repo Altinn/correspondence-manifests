@@ -1,0 +1,77 @@
+name: Pull Request
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pull-request-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate kustomize
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate kustomize structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for dir in ./manifests/environments/*/; do
+            env=$(basename "$dir")
+            if [ ! -f "./manifests/environments/${env}/kustomization.yaml" ]; then
+              echo "Error: Missing ./manifests/environments/${env}/kustomization.yaml"
+              exit 1
+            fi
+          done
+
+          for dir in ./manifests/apps/*/ ./manifests/jobs/*/; do
+            if [ ! -f "${dir}base/kustomization.yaml" ]; then
+              echo "Error: Missing ${dir}base/kustomization.yaml"
+              exit 1
+            fi
+          done
+
+          if grep -R --include='kustomization.yaml' -n 'patchesStrategicMerge' ./manifests/environments; then
+            echo "Error: Found deprecated patchesStrategicMerge usage."
+            exit 1
+          fi
+
+      - name: Validate syncroot overlays select their own environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # flux/syncroot/base pins spec.path to one environment, so every overlay
+          # must patch it. An overlay that forgets silently deploys the base
+          # environment's manifests instead of its own.
+          for dir in ./manifests/environments/*/; do
+            env=$(basename "$dir")
+            overlay="./flux/syncroot/${env}/kustomization.yaml"
+
+            if [ ! -f "$overlay" ]; then
+              echo "::error::Missing ${overlay}"
+              exit 1
+            fi
+
+            if ! grep -qE "^[[:space:]]*path:[[:space:]]*\./environments/${env}[[:space:]]*$" "$overlay"; then
+              echo "::error::${overlay} does not patch spec.path to ./environments/${env}"
+              exit 1
+            fi
+          done
+
+  kustomize-diff:
+    uses: dis-way/actions/.github/workflows/kustomize-diff.yml@45eae05af29ddb403645fc226d22ce63d3ca1ed4 # main
+    with:
+      build-paths: "manifests/environments/*,flux/syncroot/*,flux/edge-syncroot/*"
+    permissions:
+      contents: read
+      pull-requests: write
